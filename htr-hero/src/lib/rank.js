@@ -6,12 +6,17 @@ export const FOUND = 0.7;
 export const ABSENT = 0.35;
 
 // Build the TypeSafe questions payload for one shard.
+// Criteria keys are short sequential numbers ("001".."220") instead of long
+// IDs — same meaning for the model, far fewer input tokens.
 // Mirrors HTR-questions-shard-N.json.
 export function buildQuestions(shard) {
+  const width = String(shard.length).length;
   const criteria = {
     [NONE]: "None of the listed articles address the user's query.",
   };
-  for (const a of shard) criteria[a.id] = a.title;
+  shard.forEach((a, i) => {
+    criteria[String(i + 1).padStart(width, "0")] = a.title;
+  });
   return {
     recommended_article: {
       type: "choice",
@@ -27,29 +32,48 @@ export function buildQuestions(shard) {
   };
 }
 
+// Resolve a Choice answer key ("003", or "none_relevant") back to the article.
+export function resolveChoice(shards, shardIndex, key) {
+  if (!key || key === NONE) return null;
+  const n = parseInt(key, 10);
+  if (!Number.isInteger(n) || n < 1) return null;
+  return shards[shardIndex]?.[n - 1] ?? null;
+}
+
 export function verdict(exists) {
   if (exists >= FOUND) return "match found";
   if (exists < ABSENT) return "no relevant article";
   return "partial match";
 }
 
+// A shard that explicitly abstains contributes zero candidates — without
+// this, Choice's must-pick-something probabilities leak filler from shards
+// that hold nothing relevant. MIN_PROB is a second net for winners so weak
+// they are noise (uniform noise over ~220 options is ~0.005). TOP_PER_SHARD
+// finalists per participating shard keeps recall broad: near-misses from a
+// shard that *did* find something are "similar", not filler.
+const MIN_PROB = 0.02;
+const TOP_PER_SHARD = 5;
+
 // Merge one answer-set per shard into a single ranked suggestion list.
 // shardAnswers: [{ shardIndex, choice, probabilities, confidence, noul, error? }]
-// lookup: Map articleId -> article record
-export function mergeShardResults(shardAnswers, lookup, limit = 8) {
+// shards: the 4 article arrays (choice keys are per-shard numbers → resolveChoice).
+export function mergeShardResults(shardAnswers, shards, limit = 8) {
   const candidates = [];
 
   for (const s of shardAnswers) {
     if (!s || s.error) continue;
+    if (s.choice === NONE) continue;
     const ranked = Object.entries(s.probabilities || {})
-      .filter(([id]) => id !== NONE && lookup.has(id))
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 3); // top-3 per shard → up to 12 finalists
+      .map(([key, p]) => ({ article: resolveChoice(shards, s.shardIndex, key), p }))
+      .filter((e) => e.article && e.p >= MIN_PROB)
+      .sort((a, b) => b.p - a.p)
+      .slice(0, TOP_PER_SHARD); // finalists per participating shard (≤20 → top 8 shown)
 
-    for (const [id, p] of ranked) {
+    for (const e of ranked) {
       candidates.push({
-        article: lookup.get(id),
-        probability: p,
+        article: e.article,
+        probability: e.p,
         confidence: s.confidence ?? 0,
         noul: s.noul ?? 0,
         shardIndex: s.shardIndex,

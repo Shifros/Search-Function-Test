@@ -3,9 +3,16 @@ import shard1 from "./data/shards/shard-1.json";
 import shard2 from "./data/shards/shard-2.json";
 import shard3 from "./data/shards/shard-3.json";
 import shard4 from "./data/shards/shard-4.json";
-import { searchArticles, TRENDING } from "./search";
-import { isAIConfigured, searchWithAI } from "./lib/typesafeSearch";
+import { searchWithAI } from "./lib/typesafeSearch";
 import "./App.css";
+
+const TRENDING = [
+  "How to register a business name",
+  "ABN vs ACN",
+  ".com.au domain",
+  "Trademark a logo",
+  "GST registration",
+];
 
 const articles = [...shard1, ...shard2, ...shard3, ...shard4];
 
@@ -54,40 +61,38 @@ export default function App() {
   const inputRef = useRef(null);
 
   const [results, setResults] = useState([]);
-  const [ai, setAi] = useState({ mode: isAIConfigured() ? "ai" : "local", verdict: null });
+  const [searched, setSearched] = useState("");
+  const [ai, setAi] = useState({ mode: "idle", verdict: null, error: null });
   const reqId = useRef(0);
 
-  useEffect(() => {
-    setActive(0);
-    const q = query.trim();
+  // Search runs ONLY on explicit submit (Search button / Enter / trending),
+  // and ONLY via the AI fan-out — no local search.
+  async function runSearch(raw) {
+    const q = (raw ?? query).trim();
     if (q.length < 2) {
-      setResults([]);
+      inputRef.current?.focus();
       return;
     }
-    // No API key yet → instant offline search over the local index.
-    if (!isAIConfigured()) {
-      setResults(searchArticles(query, articles, 8));
-      setAi({ mode: "local", verdict: null });
-      return;
-    }
-    // API key present → fan out to Jev across the 4 shards (debounced).
     const id = ++reqId.current;
-    setAi((s) => ({ ...s, mode: "ai-loading" }));
-    const t = setTimeout(async () => {
-      try {
-        const r = await searchWithAI(query, { limit: 8 });
-        if (reqId.current !== id) return;
-        setResults(r.suggestions);
-        setAi({ mode: "ai", verdict: r.verdict });
-      } catch {
-        if (reqId.current !== id) return;
-        // Any API failure → fall back to offline search, never a dead box.
-        setResults(searchArticles(query, articles, 8));
-        setAi({ mode: "local-fallback", verdict: null });
-      }
-    }, 350);
-    return () => clearTimeout(t);
-  }, [query]);
+    setActive(0);
+    setSelected(null);
+    setShowAbout(false);
+    setOpen(true);
+    setSearched(q);
+    setAi({ mode: "ai-loading", verdict: null, error: null });
+    setResults([]);
+    try {
+      const r = await searchWithAI(q, { limit: 8 });
+      if (reqId.current !== id) return;
+      setResults(r.suggestions);
+      setAi({ mode: "ai", verdict: r.verdict, error: null });
+    } catch (err) {
+      if (reqId.current !== id) return;
+      console.error("TypeSafe request failed:", err);
+      setResults([]);
+      setAi({ mode: "error", verdict: null, error: (err && err.message) || "request failed" });
+    }
+  }
 
   useEffect(() => {
     function onDoc(e) {
@@ -97,7 +102,7 @@ export default function App() {
     return () => document.removeEventListener("mousedown", onDoc);
   }, []);
 
-  const showPanel = open && query.trim().length >= 2;
+  const showPanel = open && searched !== "";
 
   function choose(a) {
     setSelected(a);
@@ -113,7 +118,19 @@ export default function App() {
       e.preventDefault();
       setActive((i) => (i - 1 + results.length) % results.length);
     } else if (e.key === "Enter") {
-      if (results.length) choose(results[active] || results[0]);
+      // Enter submits a fresh search; if results for this exact query are
+      // already showing, Enter opens the highlighted one instead.
+      if (
+        open &&
+        searched !== "" &&
+        searched === query.trim() &&
+        ai.mode !== "ai-loading" &&
+        results.length
+      ) {
+        choose(results[active] || results[0]);
+      } else {
+        runSearch();
+      }
     } else if (e.key === "Escape") {
       setOpen(false);
     }
@@ -158,8 +175,8 @@ export default function App() {
             <input
               ref={inputRef}
               value={query}
-              onChange={(e) => { setQuery(e.target.value); setOpen(true); setSelected(null); }}
-              onFocus={() => setOpen(true)}
+              onChange={(e) => { setQuery(e.target.value); setOpen(false); setSelected(null); }}
+              onFocus={() => { if (searched) setOpen(true); }}
               onKeyDown={onKey}
               placeholder="Search for topics about business, domain, logo, website..."
               aria-label="Search help articles"
@@ -173,7 +190,7 @@ export default function App() {
                 type="button"
                 className="clear"
                 aria-label="Clear search"
-                onClick={() => { setQuery(""); setSelected(null); inputRef.current?.focus(); }}
+                onClick={() => { setQuery(""); setResults([]); setSearched(""); setSelected(null); inputRef.current?.focus(); }}
               >
                 ×
               </button>
@@ -181,7 +198,7 @@ export default function App() {
             <button
               type="button"
               className="btn btn-primary btn-search"
-              onClick={() => { setOpen(true); if (results.length) choose(results[active] || results[0]); }}
+              onClick={() => runSearch()}
             >
               Search
             </button>
@@ -190,21 +207,25 @@ export default function App() {
           {showPanel && (
             <div className="panel" id="search-results" role="listbox" aria-label="Matching articles">
               <div className="panel-head">
-                <span className={"mode-badge mode-" + ai.mode}>
-                  {ai.mode === "ai"
-                    ? `✦ AI ranked · ${ai.verdict}`
-                    : ai.mode === "ai-loading"
-                      ? "… asking Jev"
-                      : ai.mode === "local-fallback"
-                        ? "AI unreachable · offline results"
-                        : "Offline index"}
-                </span>
-                {results.length > 0 ? (
-                  <span><strong>{results.length}</strong> result{results.length === 1 ? "" : "s"} for “{query.trim()}” · {articles.length} articles indexed</span>
+                {ai.mode === "ai-loading" ? (
+                  <span>Searching for “{searched}”…</span>
+                ) : results.length > 0 ? (
+                  <span><strong>{results.length}</strong> result{results.length === 1 ? "" : "s"} for “{searched}” · {articles.length} articles indexed</span>
+                ) : ai.mode === "error" ? (
+                  <span>Search failed — please try again.</span>
                 ) : (
-                  <span>No matches for “{query.trim()}” · try “ABN”, “domain” or “trademark”</span>
+                  <span>No matches for “{searched}” · try “ABN”, “domain” or “trademark”</span>
                 )}
               </div>
+              {ai.mode === "ai-loading" && (
+                <>
+                  <div className="progress" aria-hidden="true"><span /></div>
+                  <div className="loading">
+                    <span className="spinner" aria-hidden="true" />
+                    <span>Searching…</span>
+                  </div>
+                </>
+              )}
               {results.map((a, i) => (
                 <button
                   key={a.id}
@@ -217,18 +238,22 @@ export default function App() {
                 >
                   <span className="hit-cat">{a.categoryTitle}</span>
                   <span className="hit-body">
-                    <span className="hit-title">{highlight(a.title, query)}</span>
+                    <span className="hit-title">{highlight(a.title, searched)}</span>
                     {a.excerpt && <span className="hit-ex">{a.excerpt}…</span>}
                   </span>
                   <span className="hit-go" aria-hidden="true">→</span>
                 </button>
               ))}
-              {results.length === 0 && (
+              {ai.mode !== "ai-loading" && results.length === 0 && (
                 <div className="empty">
-                  <p><strong>Nothing found.</strong> The demo index holds {articles.length} articles and runs fully in the browser.</p>
+                  {ai.mode === "error" ? (
+                    <p><strong>Search failed.</strong> Please check your connection and try again.</p>
+                  ) : (
+                    <p><strong>Nothing found.</strong> No matching articles for “{searched}”. Try rephrasing your query.</p>
+                  )}
                   <div className="empty-tags">
                     {TRENDING.map((t) => (
-                      <button key={t} type="button" onClick={() => { setQuery(t); setOpen(true); }}>{t}</button>
+                      <button key={t} type="button" onClick={() => { setQuery(t); runSearch(t); }}>{t}</button>
                     ))}
                   </div>
                 </div>
@@ -238,7 +263,7 @@ export default function App() {
         </div>
 
         <div className="quick">
-          <button type="button" className="pill" onClick={() => { setQuery("ABN registration"); setOpen(true); setSelected(null); inputRef.current?.focus(); }}>
+          <button type="button" className="pill" onClick={() => { setQuery("ABN registration"); runSearch("ABN registration"); }}>
             <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M2 12l3.5-6 2.5 3.5L11 5l3 5" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" /></svg>
             Trending searches
           </button>
@@ -264,7 +289,7 @@ export default function App() {
           <article className="preview" aria-live="polite">
             <span className="hit-cat">About</span>
             <h2>What is How To Register?</h2>
-            <p>A guided library for every stage of business setup — business, domain, email &amp; IT, logo, website and more. Use the search above to find answers across {articles.length} articles. Backend search is not wired yet; everything runs locally in your browser.</p>
+            <p>A guided library for every stage of business setup — business, domain, email &amp; IT, logo, website and more. Use the search above to find answers across {articles.length} articles.</p>
           </article>
         )}
 
@@ -287,7 +312,7 @@ export default function App() {
             <span className="blue">825 Questions</span>
           </p>
           <p className="stats-sub">Topics and information for every stage of business setup. Pick a category below or search above.</p>
-          <p className="index-note">{articles.length} articles loaded in this frontend demo · search runs 100% locally</p>
+          <p className="index-note">{articles.length} articles across 10 topics — answers for every stage of business setup</p>
         </section>
       </main>
 
